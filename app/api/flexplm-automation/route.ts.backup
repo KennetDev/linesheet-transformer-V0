@@ -1,0 +1,231 @@
+import { NextRequest, NextResponse } from 'next/server'
+import puppeteer from 'puppeteer'
+
+export async function POST(request: NextRequest) {
+  try {
+    const { styleIds } = await request.json()
+    
+    if (!styleIds || !Array.isArray(styleIds)) {
+      return NextResponse.json(
+        { error: 'Style IDs array is required' },
+        { status: 400 }
+      )
+    }
+
+    console.log('Starting FlexPLM automation for style IDs:', styleIds)
+
+    // Launch browser
+    const browser = await puppeteer.launch({
+      headless: false, // Set to true for production
+      args: [
+        '--no-sandbox', 
+        '--disable-setuid-sandbox',
+        '--disable-web-security',
+        '--disable-features=VizDisplayCompositor',
+        '--ignore-certificate-errors',
+        '--ignore-ssl-errors',
+        '--allow-running-insecure-content'
+      ]
+    })
+
+    const page = await browser.newPage()
+    
+    // Set viewport
+    await page.setViewport({ width: 1366, height: 768 })
+
+    // Set user agent to avoid detection
+    await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+
+    // Set up HTTP Basic Authentication
+    await page.authenticate({
+      username: 'tapanej',
+      password: 'Kennet@tan1'
+    })
+
+    try {
+      // Navigate to FlexPLM with HTTP Basic Auth
+      console.log('Navigating to FlexPLM with authentication...')
+      
+      await page.goto('https://flexplm.carters.com/Windchill/rfa/jsp/main/Main.jsp', {
+        waitUntil: 'networkidle2',
+        timeout: 30000
+      })
+
+      // Wait for page to fully load and JavaScript to execute
+      await new Promise(resolve => setTimeout(resolve, 8000))
+
+      console.log('Page title:', await page.title())
+      console.log('Current URL:', page.url())
+      
+      console.log('Login successful, processing style IDs...')
+
+      const results = []
+
+      // Process each style ID
+      for (const styleId of styleIds) {
+        try {
+          console.log(`Processing style ID: ${styleId}`)
+          
+          // Step 1: Switch to sidebar iframe
+          console.log('Switching to sidebar iframe...')
+          await page.waitForSelector('iframe[name="sidebarframe"]', { timeout: 10000 })
+          
+          const sidebarFrame = await page.frames().find(frame => frame.name() === 'sidebarframe')
+          if (!sidebarFrame) {
+            throw new Error('Sidebar iframe not found')
+          }
+          
+          // Step 2: Click on "Product" link in sidebar
+          console.log('Clicking on Product link...')
+          await sidebarFrame.waitForSelector('a[href="javascript:findProduct()"]', { timeout: 10000 })
+          await sidebarFrame.click('a[href="javascript:findProduct()"]')
+          
+          // Wait for the findProduct function to execute and load search interface
+          await new Promise(resolve => setTimeout(resolve, 3000))
+          
+          // Step 3: Find and use the quick search input
+          console.log('Looking for quick search input...')
+          
+          // Try to find quick search input in main page or other frames
+          let searchInput = null
+          let targetFrame = page // Start with main page
+          
+          // First try main page
+          try {
+            searchInput = await page.waitForSelector('input[name*="search"], input[placeholder*="search"], input[id*="search"], input[name*="quick"]', { timeout: 5000 })
+            console.log('Found search input in main page')
+          } catch (e) {
+            console.log('Search input not found in main page, trying other frames...')
+            
+            // Try other frames
+            const frames = page.frames()
+            for (const frame of frames) {
+              try {
+                searchInput = await frame.$('input[name*="search"], input[placeholder*="search"], input[id*="search"], input[name*="quick"], input[type="text"]')
+                if (searchInput) {
+                  targetFrame = frame
+                  console.log(`Found search input in frame: ${frame.name() || 'unnamed'}`)
+                  break
+                }
+              } catch (e) {
+                // Continue to next frame
+              }
+            }
+          }
+          
+          if (!searchInput) {
+            // Try to find any text input that might be the search box
+            try {
+              searchInput = await page.waitForSelector('input[type="text"]', { timeout: 5000 })
+              console.log('Found generic text input, assuming it\'s the search box')
+            } catch (e) {
+              throw new Error('Quick search input not found')
+            }
+          }
+          
+          // Step 4: Enter style ID in quick search
+          console.log(`Entering style ID: ${styleId}`)
+          
+          if (targetFrame === page) {
+            // Clear any existing value and type the style ID
+            await searchInput.click({ clickCount: 3 }) // Select all
+            await searchInput.type(styleId)
+          } else {
+            // Use frame-specific methods
+            const inputSelector = 'input[name*="search"], input[placeholder*="search"], input[id*="search"], input[name*="quick"], input[type="text"]'
+            await targetFrame.click(inputSelector, { clickCount: 3 })
+            await targetFrame.type(inputSelector, styleId)
+          }
+          
+          // Press Enter or click search button
+          await new Promise(resolve => setTimeout(resolve, 1000)) // Small delay before search
+          
+          if (targetFrame === page) {
+            await page.keyboard.press('Enter')
+          } else {
+            await targetFrame.keyboard.press('Enter')
+          }
+          
+          // Wait for search results
+          console.log('Waiting for search results...')
+          await new Promise(resolve => setTimeout(resolve, 5000))
+
+          // Extract search results or product information
+          const productInfo = await page.evaluate(() => {
+            // Look for product information in the page
+            const productElements = document.querySelectorAll('table tr, .product-info, .search-result')
+            const info: any = {}
+            
+            productElements.forEach(element => {
+              const text = element.textContent || ''
+              if (text.includes('Style') || text.includes('Product') || text.includes('Description')) {
+                info.content = (info.content || '') + text + '\n'
+              }
+            })
+            
+            return info
+          })
+
+          results.push({
+            styleId,
+            success: true,
+            data: productInfo
+          })
+
+          console.log(`Successfully processed ${styleId}`)
+          
+        } catch (error) {
+          console.error(`Error processing style ID ${styleId}:`, error)
+          results.push({
+            styleId,
+            success: false,
+            error: error instanceof Error ? error.message : 'Unknown error'
+          })
+        }
+      }
+
+      await browser.close()
+
+      return NextResponse.json({
+        success: true,
+        results,
+        message: `Processed ${results.length} style IDs`
+      })
+
+    } catch (error) {
+      await browser.close()
+      throw error
+    }
+
+  } catch (error) {
+    console.error('FlexPLM automation error:', error)
+    
+    // Provide more specific error messages
+    let errorMessage = 'Failed to perform FlexPLM automation'
+    let errorDetails = error instanceof Error ? error.message : 'Unknown error'
+    
+    if (errorDetails.includes('ERR_INVALID_AUTH_CREDENTIALS')) {
+      errorMessage = 'Authentication error - URL may require different credentials or VPN access'
+      errorDetails = 'The FlexPLM system returned an authentication error. This could mean:\n' +
+                    '1. The URL requires VPN access\n' +
+                    '2. The credentials are incorrect\n' +
+                    '3. The system uses different authentication method\n' +
+                    '4. The URL has changed or is not accessible'
+    } else if (errorDetails.includes('net::ERR_NAME_NOT_RESOLVED')) {
+      errorMessage = 'Network error - Cannot resolve domain'
+      errorDetails = 'Cannot access flexplm.carters.com. Check internet connection or VPN access.'
+    } else if (errorDetails.includes('timeout')) {
+      errorMessage = 'Timeout error - Page took too long to load'
+      errorDetails = 'The FlexPLM page took too long to respond. Try again or check network connection.'
+    }
+    
+    return NextResponse.json(
+      { 
+        error: errorMessage,
+        details: errorDetails,
+        suggestion: 'Try accessing the FlexPLM URL manually in a browser first to verify it works'
+      },
+      { status: 500 }
+    )
+  }
+} 
